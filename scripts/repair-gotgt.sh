@@ -10,49 +10,131 @@ FILE="$ROOT/third_party/gotgt/pkg/port/iscsit/iscsid.go"
 
 python3 - "$FILE" <<'PY'
 from pathlib import Path
-import re, sys
+import re
+import sys
 
 p = Path(sys.argv[1])
 s = p.read_text()
 
-# Remove stale process-global state if present.
-s = re.sub(r'var \(\s*EnableStats\s+bool\s*CurrentHostIP\s+string\s*IPMutex\s+sync\.Mutex\s*\)', 'var EnableStats bool', s, count=1, flags=re.S)
-s = re.sub(r'^\s*CurrentHostIP\s+string\s*\n', '', s, flags=re.M)
-s = re.sub(r'^\s*IPMutex\s+sync\.Mutex\s*\n', '', s, flags=re.M)
+# 1. Remove the process-global host state. The exact upstream formatting has
+# changed over time, so match the complete var block rather than individual lines.
+s = re.sub(
+    r'var\s*\(\s*EnableStats\s+bool\s+CurrentHostIP\s+string\s+IPMutex\s+sync\.Mutex\s*\)',
+    'var EnableStats bool', s, count=1, flags=re.S)
 
-# Ensure per-driver state exists.
-if 'currentHostIP' not in s:
+# 2. Add per-driver host state.
+if not re.search(r'\bcurrentHostIP\s+string\b', s):
     marker = '\tblockMultipleHostLogin bool'
     if marker not in s:
         raise SystemExit('ERROR: cannot find ISCSITargetDriver state marker')
     s = s.replace(marker, marker + '\n\tcurrentHostIP          string', 1)
 
-# Replace every old login bookkeeping block, not just the first occurrence.
-old_login = re.compile(r'\s*remoteIP := strings\.Split\(conn\.RemoteAddr\(\)\.String\(\), ":"\)\[0\]\s*\n\s*IPMutex\.Lock\(\)\s*\n\s*if CurrentHostIP == "" \{\s*\n\s*CurrentHostIP = remoteIP\s*\n\s*\}\s*\n\s*IPMutex\.Unlock\(\)\s*\n', re.M)
-new_login = '''\n\t\tremoteIP, _, splitErr := net.SplitHostPort(conn.RemoteAddr().String())\n\t\tif splitErr != nil {\n\t\t\t_ = conn.Close()\n\t\t\tcontinue\n\t\t}\n\n\t\tif s.blockMultipleHostLogin && s.currentHostIP == "" {\n\t\t\ts.currentHostIP = remoteIP\n\t\t}\n'''
-s, nlogin = old_login.subn(new_login, s)
+# 3. Replace the entire Run method. This removes all legacy CurrentHostIP /
+#    IPMutex bookkeeping and also removes the fatal os.Exit() behavior.
+run_re = re.compile(
+    r'func \(s \*ISCSITargetDriver\) Run\(port int\) error \{.*?\n\}\n\nfunc \(s \*ISCSITargetDriver\) setClientStatus',
+    re.S)
+run_new = '''func (s *ISCSITargetDriver) Run(port int) error {
+\tl, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+\tif err != nil {
+\t\tlog.Error(err)
+\t\treturn fmt.Errorf("listen on iSCSI port %d: %w", port, err)
+\t}
 
-# Replace any remaining direct global references.
-s = s.replace('remoteIP != CurrentHostIP', 'remoteIP != s.currentHostIP')
-s = s.replace('remoteIP, CurrentHostIP)', 'remoteIP, s.currentHostIP)')
+\ts.mu.Lock()
+\ts.l = l
+\ts.mu.Unlock()
+\tlog.Infof("iSCSI service listening on: %v", s.l.Addr())
 
-# Replace all known old logout cleanup variants.
-patterns = [
-    re.compile(r'\s*IPMutex\.Lock\(\)\s*\n\s*defer IPMutex\.Unlock\(\)\s*\n\s*addr := conn\.conn\.RemoteAddr\(\)\s*\n\s*if addr == nil \{\s*\n\s*return\s*\n\s*\}\s*\n\s*remoteIP := strings\.Split\(addr\.String\(\), ":"\)\[0\]\s*\n\s*if CurrentHostIP == remoteIP \{\s*\n\s*CurrentHostIP = ""\s*\n\s*\}', re.M),
-    re.compile(r'\s*IPMutex\.Lock\(\)\s*\n\s*addr := conn\.conn\.RemoteAddr\(\)\s*\n\s*if addr == nil \{\s*\n\s*return\s*\n\s*\}\s*\n\s*remoteIP := strings\.Split\(addr\.String\(\), ":"\)\[0\]\s*\n\s*if CurrentHostIP == remoteIP \{\s*\n\s*CurrentHostIP = ""\s*\n\s*\}\s*\n\s*IPMutex\.Unlock\(\)', re.M),
-]
-logout = '''\n\taddr := conn.conn.RemoteAddr()\n\tif addr == nil {\n\t\treturn\n\t}\n\tremoteIP, _, err := net.SplitHostPort(addr.String())\n\tif err != nil {\n\t\treturn\n\t}\n\tif s.currentHostIP == remoteIP {\n\t\ts.currentHostIP = ""\n\t}'''
-for pat in patterns:
-    s, _ = pat.subn(logout, s)
+\ts.setState(STATE_RUNNING)
+\tfor {
+\t\tconn, err := l.Accept()
+\t\tif err != nil {
+\t\t\tif err, ok := err.(net.Error); ok && !err.Temporary() {
+\t\t\t\tlog.Warning("Closing connection with initiator...")
+\t\t\t\tbreak
+\t\t\t}
+\t\t\tlog.Error(err)
+\t\t\tcontinue
+\t\t}
 
-# Remove stale imports left by the replacements.
+\t\tremoteIP, _, splitErr := net.SplitHostPort(conn.RemoteAddr().String())
+\t\tif splitErr != nil {
+\t\t\t_ = conn.Close()
+\t\t\tlog.Warningf("rejecting connection with invalid remote address %q: %v", conn.RemoteAddr(), splitErr)
+\t\t\tcontinue
+\t\t}
+
+\t\tif s.blockMultipleHostLogin {
+\t\t\ts.mu.Lock()
+\t\t\tif s.currentHostIP == "" {
+\t\t\t\ts.currentHostIP = remoteIP
+\t\t\t}
+\t\t\tallowedIP := s.currentHostIP
+\t\t\ts.mu.Unlock()
+\n\t\t\tif remoteIP != allowedIP {
+\t\t\t\t_ = conn.Close()
+\t\t\t\tlog.Infof("rejecting connection: %s target already connected at %s", remoteIP, allowedIP)
+\t\t\t\tcontinue
+\t\t\t}
+\t\t}
+
+\t\tlog.Info("connection establishing at: ", conn.LocalAddr().String())
+\t\ts.setClientStatus(true)
+
+\t\tiscsiConn := &iscsiConnection{conn: conn, loginParam: &iscsiLoginParam{}}
+\t\tiscsiConn.init()
+\t\tiscsiConn.rxIOState = IOSTATE_RX_BHS
+\t\tlog.Infof("Target is connected to initiator: %s", conn.RemoteAddr().String())
+\t\tgo s.handler(DATAIN, iscsiConn)
+\t}
+\treturn nil
+}
+
+func (s *ISCSITargetDriver) setClientStatus'''
+if not run_re.search(s):
+    raise SystemExit('ERROR: cannot locate ISCSITargetDriver.Run; gotgt source layout changed')
+s = run_re.sub(run_new, s, count=1)
+
+# 4. Replace the complete clearHostIP method. This catches both legacy logout
+#    variants and avoids fragile line-oriented matching.
+clear_re = re.compile(
+    r'func \(s \*ISCSITargetDriver\) clearHostIP\(conn \*iscsiConnection\) \{.*?\n\}\n\nfunc \(s \*ISCSITargetDriver\) rxHandler',
+    re.S)
+clear_new = '''func (s *ISCSITargetDriver) clearHostIP(conn *iscsiConnection) {
+\tif conn.conn == nil {
+\t\treturn
+\t}
+
+\taddr := conn.conn.RemoteAddr()
+\tif addr == nil {
+\t\treturn
+\t}
+\tremoteIP, _, err := net.SplitHostPort(addr.String())
+\tif err != nil {
+\t\treturn
+\t}
+
+\ts.mu.Lock()
+\tif s.currentHostIP == remoteIP {
+\t\ts.currentHostIP = ""
+\t}
+\ts.mu.Unlock()
+}
+
+func (s *ISCSITargetDriver) rxHandler'''
+if not clear_re.search(s):
+    raise SystemExit('ERROR: cannot locate clearHostIP; gotgt source layout changed')
+s = clear_re.sub(clear_new, s, count=1)
+
+# 5. Remove imports that became unused after replacing the old paths.
 s = re.sub(r'^\s*"os"\s*\n', '', s, flags=re.M)
 s = re.sub(r'^\s*"strings"\s*\n', '', s, flags=re.M)
 
-# The old globals must not survive. Fail instead of silently producing a broken tree.
+# 6. Hard validation: the old symbols must not survive.
 if re.search(r'\b(?:CurrentHostIP|IPMutex)\b', s):
-    raise SystemExit('ERROR: stale CurrentHostIP/IPMutex references remain; gotgt source layout changed')
-if 'currentHostIP' not in s:
+    raise SystemExit('ERROR: stale CurrentHostIP/IPMutex references remain after gotgt repair')
+if not re.search(r'\bcurrentHostIP\s+string\b', s):
     raise SystemExit('ERROR: currentHostIP state was not installed')
 
 p.write_text(s)
